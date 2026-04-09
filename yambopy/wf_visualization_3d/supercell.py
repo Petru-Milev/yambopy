@@ -102,6 +102,7 @@ class SupercellExpander:
         # --- assemble output ---
         sc = WavefunctionData()
         sc.psi = psi_sc
+        sc.spinor_mode = data.spinor_mode   # propagate scalar/spinor flag
         sc.grid = np.array([
             data.grid[0] * rx,
             data.grid[1] * ry,
@@ -143,47 +144,61 @@ class SupercellExpander:
     # ------------------------------------------------------------------
 
     def _tile_psi(self, psi: np.ndarray) -> np.ndarray:
-        """np.tile psi along all three spatial axes."""
+        """
+        np.tile psi along all three spatial axes.
+
+        Works for both scalar (nx, ny, nz) and spinor (2, nx, ny, nz) arrays.
+        For spinor, tiling is applied to spatial axes only.
+        """
         rx, ry, rz = self.replicas
+        if psi.ndim == 4 and psi.shape[0] == 2:
+            # spinor: tile each component independently
+            return np.stack([
+                np.tile(psi[0], (rx, ry, rz)),
+                np.tile(psi[1], (rx, ry, rz)),
+            ], axis=0)
         return np.tile(psi, (rx, ry, rz))
+
+    @staticmethod
+    def _apply_bloch_phase_scalar(psi_s, kpt_red, lat):
+        """Apply exp(ik·r) to a single (nx, ny, nz) component."""
+        nx, ny, nz = psi_s.shape
+        rlat = rec_lat(lat)
+        k_cart = 2.0 * np.pi * (kpt_red @ rlat)
+
+        fx = np.arange(nx, dtype=float) / nx
+        fy = np.arange(ny, dtype=float) / ny
+        fz = np.arange(nz, dtype=float) / nz
+        fx, fy, fz = np.meshgrid(fx, fy, fz, indexing='ij')
+        frac = np.stack([fx, fy, fz], axis=-1)
+        r_cart = frac @ lat
+        phase = np.exp(1j * np.einsum('i,...i->...', k_cart, r_cart))
+        return psi_s * phase
 
     @staticmethod
     def _apply_bloch_phase(psi, kpt_red, lat):
         """
         Multiply u_k(r) by exp(ik·r) to obtain the full Bloch wavefunction ψ_k(r).
 
+        Handles both scalar (nx, ny, nz) and spinor (2, nx, ny, nz) arrays.
+        For spinors the same Bloch phase is applied to both components.
+
         Parameters
         ----------
-        psi : ndarray, shape (nx, ny, nz)
-            Cell-periodic part u_k(r) from wfcG2r.
+        psi : ndarray, shape (nx, ny, nz) or (2, nx, ny, nz)
         kpt_red : ndarray, shape (3,)
-            K-point in reduced (crystal) coordinates.
         lat : ndarray, shape (3, 3)
-            Lattice vectors in bohr (rows).
 
         Returns
         -------
-        psi_k : ndarray, shape (nx, ny, nz)
-            ψ_k(r) = exp(ik·r) u_k(r)
+        psi with Bloch phase, same shape as input.
         """
-        nx, ny, nz = psi.shape
-        rlat = rec_lat(lat)  # b_i with a_i · b_j = δ_ij
-
-        # k in Cartesian: k_cart = 2π * (k_red @ rlat)
-        k_cart = 2.0 * np.pi * (kpt_red @ rlat)   # (3,)  in 1/bohr
-
-        # Real-space position grid: r(n) = (n1/N1)*a1 + (n2/N2)*a2 + (n3/N3)*a3
-        fx = np.arange(nx, dtype=float) / nx
-        fy = np.arange(ny, dtype=float) / ny
-        fz = np.arange(nz, dtype=float) / nz
-        fx, fy, fz = np.meshgrid(fx, fy, fz, indexing='ij')
-        frac = np.stack([fx, fy, fz], axis=-1)       # (nx, ny, nz, 3)
-        r_cart = frac @ lat                           # (nx, ny, nz, 3) bohr
-
-        # Phase factor exp(i k · r)
-        phase = np.exp(1j * np.einsum('i,...i->...', k_cart, r_cart))
-
-        return psi * phase
+        if psi.ndim == 4 and psi.shape[0] == 2:
+            # spinor: same phase for both components
+            p0 = SupercellExpander._apply_bloch_phase_scalar(psi[0], kpt_red, lat)
+            p1 = SupercellExpander._apply_bloch_phase_scalar(psi[1], kpt_red, lat)
+            return np.stack([p0, p1], axis=0)
+        return SupercellExpander._apply_bloch_phase_scalar(psi, kpt_red, lat)
 
     def _replicate_atoms(self, data: WavefunctionData):
         """

@@ -327,12 +327,16 @@ class WavefunctionVisualizer:
         """
         from vispy.scene.visuals import Arrow as ArrowVisual
 
-        segments, seg_colors, arrow_data, arrow_colors = \
+        segments, seg_colors, arrow_data, arrow_colors, alpha = \
             self._compute_arrow_geometry()
 
         if segments is None:
             self._arrow_visual = None
             return
+
+        # Compute initial arrowhead size proportional to magnitude distribution
+        mean_alpha = float(np.mean(alpha)) if len(alpha) > 0 else 0.5
+        initial_arrow_size = 4.0 + mean_alpha * 8.0
 
         self._arrow_visual = ArrowVisual(
             pos=segments,
@@ -342,7 +346,7 @@ class WavefunctionVisualizer:
             width=2.0,
             arrows=arrow_data,
             arrow_type='stealth',
-            arrow_size=8.0,
+            arrow_size=initial_arrow_size,
             arrow_color=arrow_colors,
             parent=self._view.scene,
         )
@@ -405,15 +409,32 @@ class WavefunctionVisualizer:
 
     def _on_timer(self, event):
         import time
+        from scipy.fft import fftn
 
         t0 = time.perf_counter()
 
         if self._playing:
-            for _ in range(self.steps_per_frame):
+            if self.steps_per_frame > 1:
+                self.prop.step_n(self.steps_per_frame)
+            else:
                 self.prop.step()
 
+        # Compute FFT(psi) once and share it with all consumers that need it.
+        # This avoids redundant FFTs: the arrow geometry needs psi_k for the
+        # gradient, and any future observable that needs G-space data can
+        # reuse it.
+        # Compute FFT(psi) once and share with arrow geometry.
+        # For spinor wavefunctions, compute a tuple (fft_up, fft_dn).
+        psi_k = None
+        if self._show_current and self._arrow_visual is not None:
+            if self.prop.is_spinor:
+                psi_k = (fftn(self.prop.psi[0], workers=-1),
+                         fftn(self.prop.psi[1], workers=-1))
+            else:
+                psi_k = fftn(self.prop.psi, workers=-1)
+
         self._update_density()
-        self._update_arrows()
+        self._update_arrows(psi_k=psi_k)
         self._update_hud()
 
         self._frame_count += 1
@@ -439,15 +460,13 @@ class WavefunctionVisualizer:
 
         self._vol_visual.set_data(rho_norm)
         self._vol_visual.clim = (self.density_threshold, 1.0)
-        # Reapply the custom colormap with current opacity baked into alpha
-        self._vol_visual.cmap = self._make_transparent_cmap()
 
-    def _update_arrows(self):
+    def _update_arrows(self, psi_k=None):
         if not self._show_current or self._arrow_visual is None:
             return
 
-        segments, seg_colors, arrow_data, arrow_colors = \
-            self._compute_arrow_geometry()
+        segments, seg_colors, arrow_data, arrow_colors, alpha = \
+            self._compute_arrow_geometry(psi_k=psi_k)
         if segments is None:
             return
 
@@ -457,6 +476,12 @@ class WavefunctionVisualizer:
             arrows=arrow_data,
         )
         self._arrow_visual.arrow_color = arrow_colors
+
+        # Scale arrowhead size proportional to magnitude distribution
+        # Min magnitude → 4 pixels, max magnitude → 12 pixels
+        mean_alpha = float(np.mean(alpha)) if len(alpha) > 0 else 0.5
+        scaled_arrow_size = 4.0 + mean_alpha * 8.0
+        self._arrow_visual.arrow_size = scaled_arrow_size
 
     def _update_hud(self):
         if self._hud_text is None:
@@ -473,11 +498,21 @@ class WavefunctionVisualizer:
 
         opa = self._volume_opacity
 
+        # Spinor-specific info line
+        if self.prop.is_spinor:
+            Sz_total = float(np.sum(self.prop.get_spin_density()))
+            spin_line = f" Sz_tot = {Sz_total:+.6f}  (spin-up − spin-down)\n"
+            wf_type = "spinor"
+        else:
+            spin_line = ""
+            wf_type = "scalar"
+
         info = (
-            f" t  = {t_au:.4f} a.u.  ({t_as:.3f} as)\n"
+            f" t  = {t_au:.4f} a.u.  ({t_as:.3f} as)  [{wf_type}]\n"
             f" dt = {dt_au:.4f} a.u.  ({dt_as:.3f} as)\n"
             f" step = {self.prop.step_count}  |  spf = {spf}  |  {status}\n"
             f" ||psi||^2 = {norm:.8f}  |  opacity = {opa:.0%}\n"
+            + spin_line +
             f" FPS ~ {fps:.1f}\n"
             f" [SPACE] play/pause  [+/-] speed  [D/J/A/B] toggle\n"
             f" [I/K] threshold  [O/L] opacity  [C] cmap  [R] reset  [Q] quit"
@@ -691,10 +726,14 @@ class WavefunctionVisualizer:
         elif key.lower() == 'o':
             # Decrease opacity (more transparent) — lets arrows show through
             self._volume_opacity = max(self._volume_opacity - 0.1, 0.0)
+            if self._vol_visual is not None:
+                self._vol_visual.cmap = self._make_transparent_cmap()
 
         elif key.lower() == 'l':
             # Increase opacity (more opaque)
             self._volume_opacity = min(self._volume_opacity + 0.1, 1.0)
+            if self._vol_visual is not None:
+                self._vol_visual.cmap = self._make_transparent_cmap()
 
         elif key.lower() == 'r':
             lat = self.data.lat
@@ -727,9 +766,15 @@ class WavefunctionVisualizer:
     # Geometry helpers
     # ------------------------------------------------------------------
 
-    def _compute_arrow_geometry(self):
+    def _compute_arrow_geometry(self, psi_k=None):
         """
         Compute geometry for Vispy ArrowVisual.
+
+        Parameters
+        ----------
+        psi_k : ndarray, optional
+            Pre-computed FFT of psi.  Avoids a redundant FFT when the caller
+            (the timer loop) has already computed it.
 
         Returns
         -------
@@ -737,17 +782,18 @@ class WavefunctionVisualizer:
         seg_colors : float32 (N*2, 4) — per-vertex shaft colour
         arrow_data : float32 (N, 6)   — [tail_xyz, head_xyz] for each arrowhead
         arrow_colors: float32 (N, 4)  — per-arrow head colour
-        All four are None if current is essentially zero.
+        alpha      : float32 (N,)     — normalized magnitude for each arrow [0,1]
+        All arrow values are None if current is essentially zero.
         """
         ds = self.arrow_ds
         psi = self.prop.psi
         lat = self.data.lat
-        nx, ny, nz = psi.shape
+        nx, ny, nz = self.prop.grid   # always spatial (nx, ny, nz), safe for spinor
 
-        j = compute_probability_current(psi, lat)       # (3, nx, ny, nz)
+        j = compute_probability_current(psi, lat, psi_k=psi_k)  # (3, nx, ny, nz)
         jmax = float(np.sqrt(np.sum(j**2, axis=0)).max())
         if jmax < 1e-30:
-            return None, None, None, None
+            return None, None, None, None, None
 
         # ── downsampled indices ────────────────────────────────────────
         ix = np.arange(0, nx, ds)
@@ -768,13 +814,17 @@ class WavefunctionVisualizer:
         jvec  = np.stack([j[0][flat], j[1][flat], j[2][flat]], axis=-1)
         jmag_ds = np.linalg.norm(jvec, axis=1)
 
-        # Fixed-length shafts proportional to grid spacing
+        # Arrow length proportional to |j|, scaled so the largest arrow
+        # has length cell_scale (one grid-spacing step).
         cell_scale = float(np.linalg.norm(lat[0])) / nx * ds * 0.8
         dir_unit = jvec / (jmag_ds[:, None] + 1e-30)
-        pos_head = (pos_tail + dir_unit * cell_scale).astype(np.float32)  # (N,3)
 
         # ── colours ───────────────────────────────────────────────────
         alpha = np.clip(jmag_ds / (jmax + 1e-30), 0.0, 1.0).astype(np.float32)
+
+        # Scale each arrow by its normalised magnitude so small currents
+        # get short arrows and the dominant current gets the full length.
+        pos_head = (pos_tail + dir_unit * cell_scale * alpha[:, None]).astype(np.float32)  # (N,3)
         c = np.zeros((len(alpha), 4), dtype=np.float32)
         c[:, 0] = 1.0
         c[:, 1] = np.clip(1.0 - alpha, 0.0, 1.0)   # yellow → red
@@ -794,7 +844,7 @@ class WavefunctionVisualizer:
         # ArrowVisual uses tail for direction, head as tip position.
         arrow_data = np.concatenate([pos_tail, pos_head], axis=1)  # (N, 6)
 
-        return segments, seg_colors, arrow_data, c
+        return segments, seg_colors, arrow_data, c, alpha
 
     def _grid_to_world_transform(self):
         """
@@ -811,7 +861,8 @@ class WavefunctionVisualizer:
         """
         from vispy.visuals.transforms import MatrixTransform
 
-        nx, ny, nz = self.prop.psi.shape
+        # Use spatial grid only (last 3 dims for spinor, all 3 for scalar)
+        nx, ny, nz = self.prop.grid
         lat = self.data.lat   # rows = a1, a2, a3
 
         M = np.eye(4, dtype=np.float32)

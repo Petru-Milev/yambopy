@@ -78,54 +78,139 @@ def _build_g_cart(grid, lat):
 # Core observables
 # ---------------------------------------------------------------------------
 
+def _is_spinor(psi: np.ndarray) -> bool:
+    """Return True if psi is a 2-component spinor array, shape (2, nx, ny, nz)."""
+    return psi.ndim == 4 and psi.shape[0] == 2
+
+
 def compute_density(psi: np.ndarray) -> np.ndarray:
     """
     Probability density ρ(r) = |ψ(r)|².
 
+    Handles both scalar (nx, ny, nz) and spinor (2, nx, ny, nz) inputs.
+    For spinors: ρ = |ψ↑|² + |ψ↓|²  (total density, summed over spin).
+
     Parameters
     ----------
-    psi : ndarray, complex, shape (nx, ny, nz)
+    psi : ndarray, complex, shape (nx, ny, nz) or (2, nx, ny, nz)
 
     Returns
     -------
     rho : ndarray, float, shape (nx, ny, nz)
     """
+    if _is_spinor(psi):
+        return np.abs(psi[0]) ** 2 + np.abs(psi[1]) ** 2
     return np.abs(psi) ** 2
 
 
+def compute_spin_density(psi: np.ndarray) -> np.ndarray:
+    """
+    Spin density S_z(r) = |ψ↑|² − |ψ↓|².
+
+    Requires spinor psi with shape (2, nx, ny, nz).
+    Positive = spin-up dominates, negative = spin-down dominates.
+
+    Parameters
+    ----------
+    psi : ndarray, complex, shape (2, nx, ny, nz)
+
+    Returns
+    -------
+    Sz : ndarray, float, shape (nx, ny, nz)
+    """
+    if not _is_spinor(psi):
+        raise ValueError(
+            "compute_spin_density requires spinor psi with shape (2, nx, ny, nz)."
+        )
+    return np.abs(psi[0]) ** 2 - np.abs(psi[1]) ** 2
+
+
+def compute_spin_vector(psi: np.ndarray) -> np.ndarray:
+    """
+    Full spin density vector S(r) = (S_x, S_y, S_z) via Pauli matrices.
+
+        S_x = 2 Re[ψ↑*(r) ψ↓(r)]
+        S_y = 2 Im[ψ↑*(r) ψ↓(r)]
+        S_z = |ψ↑(r)|² − |ψ↓(r)|²
+
+    Parameters
+    ----------
+    psi : ndarray, complex, shape (2, nx, ny, nz)
+
+    Returns
+    -------
+    S : ndarray, float, shape (3, nx, ny, nz)
+        S[0]=Sx, S[1]=Sy, S[2]=Sz
+    """
+    if not _is_spinor(psi):
+        raise ValueError(
+            "compute_spin_vector requires spinor psi with shape (2, nx, ny, nz)."
+        )
+    off = np.conj(psi[0]) * psi[1]
+    S_x = 2.0 * np.real(off)
+    S_y = 2.0 * np.imag(off)
+    S_z = np.abs(psi[0]) ** 2 - np.abs(psi[1]) ** 2
+    return np.stack([S_x, S_y, S_z], axis=0)
+
+
+def _compute_current_scalar(psi_s: np.ndarray, g_cart: np.ndarray,
+                             workers: int = -1,
+                             psi_k: np.ndarray = None) -> np.ndarray:
+    """
+    Probability current for a single (nx, ny, nz) component.
+    Internal helper shared by scalar and spinor paths.
+    """
+    nx, ny, nz = psi_s.shape
+    if psi_k is None:
+        psi_k = fftn(psi_s, workers=workers)
+    psi_conj = np.conj(psi_s)
+    j = np.empty((3, nx, ny, nz), dtype=float)
+    for i in range(3):
+        dpsi = ifftn(1j * g_cart[..., i] * psi_k, workers=workers)
+        j[i] = np.imag(psi_conj * dpsi)
+    return j
+
+
 def compute_probability_current(psi: np.ndarray, lat: np.ndarray,
-                                 workers: int = -1) -> np.ndarray:
+                                 workers: int = -1,
+                                 psi_k=None) -> np.ndarray:
     """
     Probability current j(r) = Im[ψ*(r) ∇ψ(r)] in atomic units.
 
     Uses the FFT-based gradient (exact for periodic BCs):
         ∂ψ/∂r_i = IFFT[i G_i(cart) · FFT[ψ]]
 
+    Handles both scalar (nx, ny, nz) and spinor (2, nx, ny, nz) inputs.
+    For spinors: j = j↑ + j↓  (total probability current, Option A).
+
     Parameters
     ----------
-    psi  : ndarray, complex, shape (nx, ny, nz)
+    psi  : ndarray, complex, shape (nx, ny, nz) or (2, nx, ny, nz)
     lat  : ndarray, float, shape (3, 3)  — lattice vectors in bohr
     workers : int, optional
         scipy FFT thread count (-1 = all).
+    psi_k : ndarray or tuple of ndarray, optional
+        Pre-computed FFT of psi (scalar) or (psi_k_up, psi_k_dn) tuple
+        for spinor. Skips redundant FFT when caller already has it.
 
     Returns
     -------
     j : ndarray, float, shape (3, nx, ny, nz)
-        j[0]=jx, j[1]=jy, j[2]=jz  in atomic units (1/bohr⁴ for normalised ψ)
+        j[0]=jx, j[1]=jy, j[2]=jz  in atomic units
     """
-    nx, ny, nz = psi.shape
-    g_cart = _build_g_cart((nx, ny, nz), lat)    # (nx, ny, nz, 3)
-
-    psi_k = fftn(psi, workers=workers)
-    psi_conj = np.conj(psi)
-
-    j = np.empty((3, nx, ny, nz), dtype=float)
-    for i in range(3):
-        dpsi = ifftn(1j * g_cart[..., i] * psi_k, workers=workers)
-        # Im[ψ*(r) · dpsi(r)]
-        j[i] = np.imag(psi_conj * dpsi)
-
-    return j
+    if _is_spinor(psi):
+        nx, ny, nz = psi.shape[1:]
+        g_cart = _build_g_cart((nx, ny, nz), lat)
+        # psi_k may be a tuple (k_up, k_dn) or None
+        k_up = psi_k[0] if (psi_k is not None) else None
+        k_dn = psi_k[1] if (psi_k is not None) else None
+        j_up = _compute_current_scalar(psi[0], g_cart, workers, psi_k=k_up)
+        j_dn = _compute_current_scalar(psi[1], g_cart, workers, psi_k=k_dn)
+        return j_up + j_dn
+    else:
+        nx, ny, nz = psi.shape
+        g_cart = _build_g_cart((nx, ny, nz), lat)
+        return _compute_current_scalar(psi, g_cart, workers, psi_k=psi_k)
 
 
 def compute_current_magnitude(psi: np.ndarray, lat: np.ndarray,
@@ -145,7 +230,8 @@ def compute_norm(psi: np.ndarray) -> float:
     """
     Squared norm ‖ψ‖² = Σ |ψ(r)|².
 
-    For a properly normalised wavefunction on a discrete grid this equals 1.
+    Works for both scalar (nx, ny, nz) and spinor (2, nx, ny, nz).
+    For spinors: ||ψ||² = ||ψ↑||² + ||ψ↓||².
 
     Returns
     -------
@@ -181,12 +267,15 @@ def compute_energy(psi: np.ndarray, lat: np.ndarray,
     ⟨T⟩ = Σ_G |ψ_G|² |G|²/2  (Parseval, with normalisation)
     ⟨V⟩ = Σ_r |ψ(r)|² V(r)
 
+    Handles both scalar (nx, ny, nz) and spinor (2, nx, ny, nz).
+    For spinors: ⟨T⟩ = ⟨T⟩↑ + ⟨T⟩↓, ⟨V⟩ = ⟨V⟩↑ + ⟨V⟩↓.
+
     Parameters
     ----------
-    psi : ndarray, complex, shape (nx, ny, nz)
+    psi : ndarray, complex, shape (nx, ny, nz) or (2, nx, ny, nz)
     lat : ndarray, float, shape (3, 3)  lattice vectors in bohr
     V   : ndarray, float, shape (nx, ny, nz), optional
-        Local potential in Hartree. Default: zero (free particle).
+        Local potential in Hartree (same for both spinor components).
     workers : int, optional
         scipy FFT thread count.
 
@@ -194,19 +283,29 @@ def compute_energy(psi: np.ndarray, lat: np.ndarray,
     -------
     E : float  (Hartree)
     """
-    nx, ny, nz = psi.shape
-    g_cart = _build_g_cart((nx, ny, nz), lat)
-    k2 = np.einsum('...i,...i->...', g_cart, g_cart)   # |G|² in 1/bohr²
-    T_op = k2 / 2.0
-
-    psi_k = fftn(psi, workers=workers)
-    N = nx * ny * nz
-    T_exp = float(np.sum(np.abs(psi_k) ** 2 * T_op) / N)
-
-    if V is not None:
-        V_exp = float(np.sum(np.abs(psi) ** 2 * V))
+    if _is_spinor(psi):
+        grid = psi.shape[1:]
     else:
+        grid = psi.shape
+    nx, ny, nz = grid
+
+    g_cart = _build_g_cart(grid, lat)
+    k2 = np.einsum('...i,...i->...', g_cart, g_cart)
+    T_op = k2 / 2.0
+    N = nx * ny * nz
+
+    if _is_spinor(psi):
+        T_exp = 0.0
         V_exp = 0.0
+        for s in range(2):
+            psi_k = fftn(psi[s], workers=workers)
+            T_exp += float(np.sum(np.abs(psi_k) ** 2 * T_op) / N)
+            if V is not None:
+                V_exp += float(np.sum(np.abs(psi[s]) ** 2 * V))
+    else:
+        psi_k = fftn(psi, workers=workers)
+        T_exp = float(np.sum(np.abs(psi_k) ** 2 * T_op) / N)
+        V_exp = float(np.sum(np.abs(psi) ** 2 * V)) if V is not None else 0.0
 
     return T_exp + V_exp
 

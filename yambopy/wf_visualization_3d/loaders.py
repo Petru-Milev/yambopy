@@ -39,8 +39,13 @@ class WavefunctionData:
 
     Attributes
     ----------
-    psi : ndarray, complex, shape (nx, ny, nz)
+    psi : ndarray, complex
         Wavefunction in real space on the unit-cell grid (atomic units, normalized).
+        Shape is (nx, ny, nz) for scalar (non-magnetic or collinear spin-polarized)
+        or (2, nx, ny, nz) for a 2-component spinor (non-collinear / SOC).
+    spinor_mode : str
+        'scalar'  — single spin channel, shape (nx, ny, nz)
+        'spinor'  — both spinor components, shape (2, nx, ny, nz)
     grid : ndarray, int, shape (3,)
         Grid dimensions [nx, ny, nz].
     lat : ndarray, float, shape (3, 3)
@@ -66,7 +71,7 @@ class WavefunctionData:
     ib : int or list of int
         Band index (or list if superposition).
     spin : int
-        Spin component used.
+        Spin component used (0 or 1; for spinor mode both are loaded together).
     volume : float
         Unit cell volume in bohr³.
     norm : float
@@ -75,6 +80,7 @@ class WavefunctionData:
 
     def __init__(self):
         self.psi = None
+        self.spinor_mode = 'scalar'   # 'scalar' or 'spinor'
         self.grid = None
         self.lat = None
         self.lat_ang = None
@@ -99,12 +105,18 @@ class WavefunctionData:
     def shape(self):
         return tuple(self.grid) if self.grid is not None else None
 
+    @property
+    def is_spinor(self):
+        """True if psi has shape (2, nx, ny, nz) (2-component spinor)."""
+        return self.spinor_mode == 'spinor'
+
     def __repr__(self):
         if self.psi is None:
             return "WavefunctionData(empty)"
         return (
             f"WavefunctionData("
             f"grid={list(self.grid)}, ik={self.ik}, ib={self.ib}, "
+            f"spinor_mode={self.spinor_mode!r}, "
             f"natoms={self.natoms}, norm={self.norm:.6f})"
         )
 
@@ -224,9 +236,49 @@ class WavefunctionLoader:
             )
         return psi.copy()
 
+    def _extract_spinor_psi(self, wfc_rs, spin=0):
+        """
+        Extract both spinor components as a (2, nx, ny, nz) complex array.
+
+        Used for non-collinear / SOC systems where nspinor == 2.
+        Both ψ↑ and ψ↓ are stacked on axis 0.
+
+        Parameters
+        ----------
+        wfc_rs : ndarray
+            Output of wfcG2r, shape (nspin, nspinor, nx, ny, nz) or (nx, ny, nz).
+        spin : int
+            Spin row to use (only relevant when nspin > 1, rare for non-collinear).
+
+        Returns
+        -------
+        psi : ndarray, complex, shape (2, nx, ny, nz)
+        """
+        if wfc_rs.ndim == 5:
+            # (nspin, nspinor, nx, ny, nz)
+            nspinor = wfc_rs.shape[1]
+            psi_up = wfc_rs[spin, 0].copy()
+            if nspinor >= 2:
+                psi_dn = wfc_rs[spin, 1].copy()
+            else:
+                # Only one spinor component available (collinear calc loaded in spinor mode)
+                psi_dn = np.zeros_like(psi_up)
+        elif wfc_rs.ndim == 3:
+            # scalar wfcG2r output — treat as spin-up only
+            psi_up = wfc_rs.copy()
+            psi_dn = np.zeros_like(psi_up)
+        else:
+            raise ValueError(
+                f"Unexpected wfcG2r output shape {wfc_rs.shape}."
+            )
+        return np.stack([psi_up, psi_dn], axis=0)  # (2, nx, ny, nz)
+
     @staticmethod
     def _normalize(psi):
-        """Normalize psi in place. Returns (psi, norm)."""
+        """
+        Normalize psi in place. Works for both scalar (nx, ny, nz)
+        and spinor (2, nx, ny, nz) arrays. Returns (psi, norm).
+        """
         norm = float(np.sqrt(np.sum(np.abs(psi) ** 2)))
         if norm > 0.0:
             psi = psi / norm
@@ -236,7 +288,7 @@ class WavefunctionLoader:
     # Public API
     # ------------------------------------------------------------------
 
-    def load(self, ik=0, ib=0, grid=None, spin=0, spinor=0):
+    def load(self, ik=0, ib=0, grid=None, spin=0, spinor=0, load_spinor=False):
         """
         Load a single wavefunction band at a given k-point and convert to real space.
 
@@ -251,31 +303,53 @@ class WavefunctionLoader:
             Defaults to the minimal fft_box from the database.
         spin : int
             Spin component to extract (0 or 1).
+            For collinear spin-polarized systems: spin=0 loads spin-up,
+            spin=1 loads spin-down (each as a scalar wavefunction).
         spinor : int
-            Spinor component to extract (0 or 1; relevant for SOC).
+            Spinor component to extract when load_spinor=False (0 or 1).
+            Ignored when load_spinor=True.
+        load_spinor : bool
+            If True, load both spinor components (ψ↑ and ψ↓) simultaneously
+            into a single (2, nx, ny, nz) array. Required for correct treatment
+            of non-collinear / SOC wavefunctions (Option A propagation).
+            If False (default), load a single scalar component as before.
 
         Returns
         -------
         WavefunctionData
+            data.spinor_mode == 'spinor' when load_spinor=True,
+            data.spinor_mode == 'scalar' otherwise.
 
         Notes
         -----
         For a real eigenstate at Γ (k=0), the probability current j = Im[ψ*∇ψ]
         is identically zero. Use load_multi_band or choose k≠0 for non-trivial
         current dynamics.
+
+        For spin-polarized (collinear) systems, each spin channel is a valid
+        scalar wavefunction. Load spin=0 and spin=1 separately to compare them.
         """
         self._ensure_wfdb()
 
         grid = list(grid) if grid is not None else list(self._wfdb.fft_box)
 
-        print(f"[WavefunctionLoader] FFT ik={ik}, ib={ib}, grid={grid} ...")
+        mode_str = "spinor" if load_spinor else f"spinor={spinor}"
+        print(f"[WavefunctionLoader] FFT ik={ik}, ib={ib}, spin={spin}, "
+              f"{mode_str}, grid={grid} ...")
         wfc_rs = self._wfdb.wfcG2r(ik=ik, ib=ib, grid=grid)
 
-        psi = self._extract_psi(wfc_rs, spin=spin, spinor=spinor)
+        if load_spinor:
+            psi = self._extract_spinor_psi(wfc_rs, spin=spin)
+            spinor_mode = 'spinor'
+        else:
+            psi = self._extract_psi(wfc_rs, spin=spin, spinor=spinor)
+            spinor_mode = 'scalar'
+
         psi, norm = self._normalize(psi)
 
         data = WavefunctionData()
         data.psi = psi
+        data.spinor_mode = spinor_mode
         data.grid = np.array(grid, dtype=int)
         data.ik = ik
         data.ib = ib
@@ -287,7 +361,7 @@ class WavefunctionLoader:
         return data
 
     def load_multi_band(self, ik=0, bands=None, grid=None, spin=0, spinor=0,
-                        weights=None):
+                        weights=None, load_spinor=False):
         """
         Build a coherent superposition of multiple bands.
 
@@ -302,11 +376,16 @@ class WavefunctionLoader:
             Band indices to include in the superposition.
         grid : list [nx, ny, nz], optional
             Real-space FFT grid.
-        spin, spinor : int
-            Spin/spinor components.
+        spin : int
+            Spin channel (0 or 1).
+        spinor : int
+            Spinor component when load_spinor=False.
         weights : array-like of complex, optional
             Mixing coefficients c_n. Internally normalized to unit total weight.
             Default: equal-weight mixture (all 1/sqrt(N)).
+        load_spinor : bool
+            If True, load both spinor components for each band and build the
+            superposition in spinor space → psi shape (2, nx, ny, nz).
 
         Returns
         -------
@@ -330,13 +409,19 @@ class WavefunctionLoader:
 
         # First band to get shape
         wfc_rs = self._wfdb.wfcG2r(ik=ik, ib=bands[0], grid=grid)
-        psi0 = self._extract_psi(wfc_rs, spin=spin, spinor=spinor)
+        if load_spinor:
+            psi0 = self._extract_spinor_psi(wfc_rs, spin=spin)
+        else:
+            psi0 = self._extract_psi(wfc_rs, spin=spin, spinor=spinor)
         psi0, _ = self._normalize(psi0)
         psi_super = weights[0] * psi0
 
         for i, ib in enumerate(bands[1:], 1):
             wfc_rs = self._wfdb.wfcG2r(ik=ik, ib=ib, grid=grid)
-            psi_i = self._extract_psi(wfc_rs, spin=spin, spinor=spinor)
+            if load_spinor:
+                psi_i = self._extract_spinor_psi(wfc_rs, spin=spin)
+            else:
+                psi_i = self._extract_psi(wfc_rs, spin=spin, spinor=spinor)
             psi_i, _ = self._normalize(psi_i)
             psi_super = psi_super + weights[i] * psi_i
 
@@ -344,6 +429,7 @@ class WavefunctionLoader:
 
         data = WavefunctionData()
         data.psi = psi_super
+        data.spinor_mode = 'spinor' if load_spinor else 'scalar'
         data.grid = np.array(grid, dtype=int)
         data.ik = ik
         data.ib = list(bands)

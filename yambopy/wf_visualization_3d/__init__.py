@@ -42,6 +42,8 @@ from .supercell import SupercellExpander
 from .propagator import WavefunctionPropagator
 from .observables import (
     compute_density,
+    compute_spin_density,
+    compute_spin_vector,
     compute_probability_current,
     compute_current_magnitude,
     compute_norm,
@@ -64,6 +66,8 @@ __all__ = [
     'WavefunctionPropagator',
     # Observables
     'compute_density',
+    'compute_spin_density',
+    'compute_spin_vector',
     'compute_probability_current',
     'compute_current_magnitude',
     'compute_norm',

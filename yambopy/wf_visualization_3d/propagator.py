@@ -83,14 +83,14 @@ class WavefunctionPropagator:
         self.dt = float(dt)
         self.workers = workers
         self.lat = data.lat
-        self.grid = tuple(data.grid)
+        self.grid = tuple(data.grid)     # always (nx, ny, nz) — spatial only
         self.volume = data.volume
 
         # Working copy and initial state
         self.psi = data.psi.astype(complex, copy=True)
         self._psi0 = self.psi.copy()
 
-        # Potential
+        # Potential — always (nx, ny, nz) regardless of spinor mode
         if V is None:
             self.V = np.zeros(self.grid, dtype=float)
         else:
@@ -106,6 +106,15 @@ class WavefunctionPropagator:
         # Precompute propagators
         self._setup_kinetic_propagator()
         self._setup_potential_propagators()
+
+    # ------------------------------------------------------------------
+    # Spinor detection helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def is_spinor(self) -> bool:
+        """True when psi has shape (2, nx, ny, nz)."""
+        return self.psi.ndim == 4
 
     # ------------------------------------------------------------------
     # Setup (called once at construction)
@@ -149,48 +158,61 @@ class WavefunctionPropagator:
     # Time evolution
     # ------------------------------------------------------------------
 
+    def _soft_step_scalar(self, psi):
+        """One SOFT step for a scalar (nx, ny, nz) wavefunction. Returns updated psi."""
+        psi *= self._half_V_exp
+        psi_k = fftn(psi, workers=self.workers)
+        psi_k *= self._kinetic_exp
+        psi = ifftn(psi_k, workers=self.workers)
+        psi *= self._half_V_exp
+        return psi
+
+    def _soft_step_n_scalar(self, psi, n):
+        """n merged SOFT steps for a scalar wavefunction. Returns updated psi."""
+        psi *= self._half_V_exp
+        for _ in range(n - 1):
+            psi_k = fftn(psi, workers=self.workers)
+            psi_k *= self._kinetic_exp
+            psi = ifftn(psi_k, workers=self.workers)
+            psi *= self._full_V_exp
+        psi_k = fftn(psi, workers=self.workers)
+        psi_k *= self._kinetic_exp
+        psi = ifftn(psi_k, workers=self.workers)
+        psi *= self._half_V_exp
+        return psi
+
     def step(self):
         """
         Advance the wavefunction by one time step dt using the SOFT algorithm:
             ψ → exp(-i V dt/2) · IFFT[exp(-i T dt) · FFT[exp(-i V dt/2) · ψ]]
+
+        For spinor wavefunctions (Option A), each component is propagated
+        independently with the same scalar kinetic + local-potential SOFT step.
+        Spin-orbit coupling between components is NOT included (Option A).
         """
-        # Half-step: potential in real space
-        self.psi *= self._half_V_exp
-
-        # Full step: kinetic in G-space
-        psi_k = fftn(self.psi, workers=self.workers)
-        psi_k *= self._kinetic_exp
-        self.psi = ifftn(psi_k, workers=self.workers)
-
-        # Half-step: potential in real space
-        self.psi *= self._half_V_exp
+        if self.is_spinor:
+            self.psi[0] = self._soft_step_scalar(self.psi[0])
+            self.psi[1] = self._soft_step_scalar(self.psi[1])
+        else:
+            self.psi = self._soft_step_scalar(self.psi)
 
         self.time += self.dt
         self.step_count += 1
 
     def step_n(self, n: int):
-        """Advance by n steps (uses consecutive potential half-steps for efficiency)."""
+        """
+        Advance by n steps (uses merged potential half-steps for efficiency).
+
+        For spinor wavefunctions both components are advanced independently.
+        """
         if n <= 0:
             return
 
-        # First half-step
-        self.psi *= self._half_V_exp
-
-        for _ in range(n - 1):
-            # Kinetic full-step
-            psi_k = fftn(self.psi, workers=self.workers)
-            psi_k *= self._kinetic_exp
-            self.psi = ifftn(psi_k, workers=self.workers)
-            # Merge consecutive potential half-steps into one full-step
-            self.psi *= self._full_V_exp
-
-        # Last kinetic step
-        psi_k = fftn(self.psi, workers=self.workers)
-        psi_k *= self._kinetic_exp
-        self.psi = ifftn(psi_k, workers=self.workers)
-
-        # Last half-step
-        self.psi *= self._half_V_exp
+        if self.is_spinor:
+            self.psi[0] = self._soft_step_n_scalar(self.psi[0], n)
+            self.psi[1] = self._soft_step_n_scalar(self.psi[1], n)
+        else:
+            self.psi = self._soft_step_n_scalar(self.psi, n)
 
         self.time += self.dt * n
         self.step_count += n
@@ -203,24 +225,70 @@ class WavefunctionPropagator:
         """
         Probability density ρ(r,t) = |ψ(r,t)|².
 
+        For spinor wavefunctions: ρ = |ψ↑|² + |ψ↓|²  (total density).
+
         Returns
         -------
         rho : ndarray, float, shape (nx, ny, nz)
         """
+        if self.is_spinor:
+            return np.abs(self.psi[0]) ** 2 + np.abs(self.psi[1]) ** 2
         return np.abs(self.psi) ** 2
+
+    def get_spin_density(self) -> np.ndarray:
+        """
+        Spin density S_z(r,t) = |ψ↑|² − |ψ↓|².
+
+        Only available for spinor wavefunctions (load_spinor=True).
+        Positive values = spin-up dominates; negative = spin-down dominates.
+
+        Returns
+        -------
+        Sz : ndarray, float, shape (nx, ny, nz)
+
+        Raises
+        ------
+        ValueError if psi is scalar.
+        """
+        if not self.is_spinor:
+            raise ValueError(
+                "Spin density requires a spinor wavefunction. "
+                "Load with load_spinor=True."
+            )
+        return np.abs(self.psi[0]) ** 2 - np.abs(self.psi[1]) ** 2
+
+    def get_spin_vector(self) -> np.ndarray:
+        """
+        Full spin density vector S(r,t) = (S_x, S_y, S_z).
+
+        Computed via Pauli matrices: S_i = ψ† σ_i ψ
+            S_x = 2 Re[ψ↑* ψ↓]
+            S_y = 2 Im[ψ↑* ψ↓]
+            S_z = |ψ↑|² − |ψ↓|²
+
+        Returns
+        -------
+        S : ndarray, float, shape (3, nx, ny, nz)
+        """
+        if not self.is_spinor:
+            raise ValueError("Spin vector requires a spinor wavefunction.")
+        off = np.conj(self.psi[0]) * self.psi[1]
+        S_x = 2.0 * np.real(off)
+        S_y = 2.0 * np.imag(off)
+        S_z = np.abs(self.psi[0]) ** 2 - np.abs(self.psi[1]) ** 2
+        return np.stack([S_x, S_y, S_z], axis=0)
 
     def get_probability_current(self) -> np.ndarray:
         """
         Probability current j(r,t) = Im[ψ*(r,t) ∇ψ(r,t)]  in atomic units.
-        (Equivalent to (ℏ/m) Im[ψ* ∇ψ] with ℏ=m=1.)
 
-        Uses FFT-based gradient for exact periodic-boundary-condition differentiation:
-            ∂ψ/∂x_i = IFFT[ i G_i · FFT[ψ] ]
+        For spinor wavefunctions: j = j↑ + j↓  (total current, Option A).
+
+        Uses FFT-based gradient: ∂ψ/∂x_i = IFFT[ i G_i · FFT[ψ] ]
 
         Returns
         -------
         j : ndarray, float, shape (3, nx, ny, nz)
-            Components j[0], j[1], j[2] along x, y, z respectively.
         """
         nx, ny, nz = self.grid
         rlat = rec_lat(self.lat)
@@ -232,14 +300,22 @@ class WavefunctionPropagator:
         g_int = np.stack([gx, gy, gz], axis=-1)
         g_cart = 2.0 * np.pi * (g_int @ rlat)   # (nx, ny, nz, 3)
 
-        psi_k = fftn(self.psi, workers=self.workers)
-        psi_conj = np.conj(self.psi)
+        j = np.zeros((3, nx, ny, nz), dtype=float)
 
-        j = np.empty((3, nx, ny, nz), dtype=float)
-        for i in range(3):
-            # ∂ψ/∂r_i = IFFT[i G_i ψ_k]
-            dpsi = ifftn(1j * g_cart[..., i] * psi_k, workers=self.workers)
-            j[i] = np.imag(psi_conj * dpsi)  # j_i = Im[ψ* · ∂ψ/∂r_i]
+        def _current_scalar(psi_s):
+            psi_k = fftn(psi_s, workers=self.workers)
+            psi_conj = np.conj(psi_s)
+            j_s = np.empty((3, nx, ny, nz), dtype=float)
+            for i in range(3):
+                dpsi = ifftn(1j * g_cart[..., i] * psi_k, workers=self.workers)
+                j_s[i] = np.imag(psi_conj * dpsi)
+            return j_s
+
+        if self.is_spinor:
+            j += _current_scalar(self.psi[0])
+            j += _current_scalar(self.psi[1])
+        else:
+            j = _current_scalar(self.psi)
 
         return j
 
@@ -260,7 +336,7 @@ class WavefunctionPropagator:
         """
         Energy expectation value ⟨H⟩ = ⟨T⟩ + ⟨V⟩ in Hartree.
 
-        Should be conserved to ~machine precision for the SOFT integrator.
+        For spinor: ⟨T⟩ = ⟨T⟩↑ + ⟨T⟩↓, ⟨V⟩ = ⟨V⟩↑ + ⟨V⟩↓.
 
         Returns
         -------
@@ -277,19 +353,27 @@ class WavefunctionPropagator:
         g_cart = 2.0 * np.pi * (g_int @ rlat)
         k2 = np.einsum('...i,...i->...', g_cart, g_cart)
         T_op = k2 / 2.0
-
-        psi_k = fftn(self.psi, workers=self.workers)
-        # ⟨T⟩ = Σ_G |ψ_G|² T(G)  (Parseval — need to normalise by N)
         N = nx * ny * nz
-        T_exp = float(np.sum(np.abs(psi_k) ** 2 * T_op) / N)
 
-        V_exp = float(np.sum(np.abs(self.psi) ** 2 * self.V))
+        if self.is_spinor:
+            T_exp = 0.0
+            V_exp = 0.0
+            for s in range(2):
+                psi_k = fftn(self.psi[s], workers=self.workers)
+                T_exp += float(np.sum(np.abs(psi_k) ** 2 * T_op) / N)
+                V_exp += float(np.sum(np.abs(self.psi[s]) ** 2 * self.V))
+        else:
+            psi_k = fftn(self.psi, workers=self.workers)
+            T_exp = float(np.sum(np.abs(psi_k) ** 2 * T_op) / N)
+            V_exp = float(np.sum(np.abs(self.psi) ** 2 * self.V))
 
         return T_exp + V_exp
 
     def get_norm(self) -> float:
         """
         Squared norm ‖ψ‖² = Σ |ψ(r)|² (should remain ≈ 1).
+
+        For spinor: ||ψ||² = ||ψ↑||² + ||ψ↓||².
 
         Returns
         -------
