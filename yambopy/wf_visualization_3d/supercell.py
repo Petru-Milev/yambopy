@@ -42,7 +42,7 @@ class SupercellExpander:
     >>> sc_data  = expander.expand(uc_data)
     """
 
-    def __init__(self, replicas=(3, 3, 1)):
+    def __init__(self, replicas=(1, 1, 1)):
         self.replicas = tuple(int(r) for r in replicas)
         if len(self.replicas) != 3:
             raise ValueError("replicas must be a 3-tuple (rx, ry, rz).")

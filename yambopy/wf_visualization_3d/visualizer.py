@@ -16,9 +16,11 @@ Keyboard controls (printed on startup)
 SPACE          play / pause animation
 +  /  -        double / halve propagation speed (steps per frame)
 D              toggle density volume
-J              toggle probability current arrows
+J              toggle probability current (arrows or streamlines)
+S              switch current display: arrows  ↔  streamlines
 A              toggle atom markers
 B              toggle cell box
+V              switch volume: density |ψ|²  ↔  current heatmap |j(r)|
 I  /  K        raise / lower isosurface threshold by 10%
 O  /  L        decrease / increase volume opacity by 10%
 C              cycle colormap (grays → hot → viridis → cool → grays)
@@ -53,6 +55,7 @@ import numpy as np
 from .observables import (
     compute_density,
     compute_probability_current,
+    compute_current_magnitude,
     compute_energy,
     compute_norm,
 )
@@ -154,6 +157,10 @@ class WavefunctionVisualizer:
         self._colormaps = ['grays', 'hot', 'viridis', 'cool', 'blues']
         self._cmap_idx = 1  # start with 'hot'
         self._volume_opacity = 1.0   # 0.0 = fully transparent, 1.0 = full
+        self._volume_mode = 'density'  # 'density' = |ψ|²,  'current' = |j(r)|
+        self._current_mode = 'arrows'  # 'arrows' or 'streamlines'
+        self._streamline_nseeds = 80   # number of seed points for streamlines
+        self._streamline_steps = 60    # integration steps per streamline
         self._frame_count = 0
         self._fps_timer = 0.0
 
@@ -162,6 +169,7 @@ class WavefunctionVisualizer:
         self._view = None
         self._vol_visual = None
         self._arrow_visual = None
+        self._streamline_visual = None
         self._atom_visual = None
         self._box_visual = None
         self._hud_text = None
@@ -234,6 +242,7 @@ class WavefunctionVisualizer:
         self._build_atoms()
         self._build_density_volume()
         self._build_current_arrows()
+        self._build_current_streamlines()
         self._build_hud()
         self._build_legend()
 
@@ -271,9 +280,38 @@ class WavefunctionVisualizer:
         )
         self._atom_visual.order = 2
 
+    def _compute_volume_data(self, psi_k=None):
+        """
+        Compute the 3D scalar field for the volume visual, depending on mode.
+
+        Returns
+        -------
+        vol_norm : ndarray, float32, (nx, ny, nz) — normalised to [0, 1]
+        vol_max  : float — the raw maximum before normalisation
+        """
+        if self._volume_mode == 'current':
+            jmag = compute_current_magnitude(
+                self.prop.psi, self.data.lat
+            ).astype(np.float32)
+            vol_max = float(jmag.max())
+            if vol_max > 0:
+                vol_norm = jmag / vol_max
+            else:
+                vol_norm = jmag
+        else:
+            # default: density |ψ|²
+            rho = compute_density(self.prop.psi).astype(np.float32)
+            vol_max = float(rho.max())
+            if vol_max > 0:
+                vol_norm = rho / vol_max
+            else:
+                vol_norm = rho
+        return vol_norm, vol_max
+
     def _build_density_volume(self):
         """
-        Semi-transparent volume rendering of the probability density |ψ|².
+        Semi-transparent volume rendering of |ψ|² or |j(r)|, depending on
+        self._volume_mode ('density' or 'current').
 
         Volume data is mapped from (nx, ny, nz) on the grid to world coordinates
         via an affine transform derived from the lattice vectors.
@@ -283,19 +321,11 @@ class WavefunctionVisualizer:
         than accumulating into an opaque dark block (the usual 'translucent'
         issue with standard colormaps that have alpha=1 everywhere).
         """
-        rho = compute_density(self.prop.psi).astype(np.float32)
-
-        # Normalise to [0, 1] for the colormap
-        rho_max = rho.max()
-        if rho_max > 0:
-            rho_norm = rho / rho_max
-        else:
-            rho_norm = rho
-
-        self._rho_max = float(rho_max)
+        vol_norm, vol_max = self._compute_volume_data()
+        self._rho_max = vol_max
 
         self._vol_visual = self._scene.visuals.Volume(
-            rho_norm,
+            vol_norm,
             cmap=self._make_transparent_cmap(),
             clim=(self.density_threshold, 1.0),
             method='translucent',
@@ -354,6 +384,208 @@ class WavefunctionVisualizer:
         # Always visible, even when inside the volume
         self._arrow_visual.set_gl_state('translucent', depth_test=False)
         self._arrow_visual.order = 1
+
+        # If starting in streamlines mode, hide arrows initially
+        if self._current_mode == 'streamlines' and self._arrow_visual is not None:
+            self._arrow_visual.visible = False
+
+    def _build_current_streamlines(self):
+        """
+        3D streamlines of the probability current j(r,t).
+
+        Seed points are placed at locations of high current magnitude, then
+        integrated forward (and optionally backward) along j(r) using an
+        Euler scheme with trilinear interpolation.
+
+        Each streamline is coloured by local |j| magnitude (yellow→red).
+        """
+        lines, colors = self._compute_streamline_geometry()
+
+        if lines is None:
+            self._streamline_visual = None
+            return
+
+        self._streamline_visual = self._scene.visuals.Line(
+            pos=lines,
+            color=colors,
+            connect='strip',
+            method='gl',
+            width=2.0,
+            parent=self._view.scene,
+        )
+        self._streamline_visual.set_gl_state('translucent', depth_test=False)
+        self._streamline_visual.order = 1
+
+        # If starting in arrows mode, hide streamlines initially
+        if self._current_mode == 'arrows':
+            self._streamline_visual.visible = False
+
+    def _compute_streamline_geometry(self, psi_k=None):
+        """
+        Integrate streamlines through the probability current field j(r).
+
+        Returns
+        -------
+        lines  : float32 (M, 3) — concatenated polyline vertices (NaN-separated)
+        colors : float32 (M, 4) — per-vertex RGBA colours
+        Both None if current is essentially zero.
+        """
+        psi = self.prop.psi
+        lat = self.data.lat
+        nx, ny, nz = self.prop.grid
+
+        j = compute_probability_current(psi, lat, psi_k=psi_k)  # (3, nx, ny, nz)
+        jmag = np.sqrt(np.sum(j ** 2, axis=0))                  # (nx, ny, nz)
+        jmax = float(jmag.max())
+        if jmax < 1e-30:
+            return None, None
+
+        n_seeds = self._streamline_nseeds
+        n_steps = self._streamline_steps
+
+        # ── Seed points: choose grid points with highest |j| ──────────
+        flat_idx = np.argsort(jmag.ravel())[::-1]
+        # Take top seeds, but spaced apart to avoid clumping
+        seed_frac = []
+        min_frac_dist = 2.0 / max(nx, ny, nz)  # minimum separation in frac coords
+        for idx in flat_idx:
+            if len(seed_frac) >= n_seeds:
+                break
+            ix, iy, iz = np.unravel_index(idx, (nx, ny, nz))
+            f = np.array([ix / nx, iy / ny, iz / nz])
+            # Check distance from existing seeds
+            if seed_frac:
+                dists = np.array([np.linalg.norm(f - s) for s in seed_frac])
+                if dists.min() < min_frac_dist:
+                    continue
+            seed_frac.append(f)
+
+        if not seed_frac:
+            return None, None
+
+        seed_frac = np.array(seed_frac)             # (n_seeds, 3)
+        seed_cart = (seed_frac @ lat).astype(np.float64)  # (n_seeds, 3)
+
+        # ── Integration step size ─────────────────────────────────────
+        # Step length ≈ 0.5 grid spacings in Cartesian
+        cell_step = float(np.linalg.norm(lat[0])) / nx * 0.5
+        dt_stream = cell_step / (jmax + 1e-30)
+
+        # ── Pre-build inverse lattice for Cartesian→fractional ────────
+        lat_inv = np.linalg.inv(lat)  # frac = cart @ lat_inv
+
+        def _interp_j(pos_cart):
+            """Trilinear interpolation of j at Cartesian position."""
+            frac = pos_cart @ lat_inv               # (n, 3) fractional
+            frac = frac % 1.0                       # wrap periodic
+            # Grid indices (float)
+            gi = frac[:, 0] * nx
+            gj = frac[:, 1] * ny
+            gk = frac[:, 2] * nz
+            # Integer floor indices
+            i0 = np.floor(gi).astype(int) % nx
+            j0 = np.floor(gj).astype(int) % ny
+            k0 = np.floor(gk).astype(int) % nz
+            i1 = (i0 + 1) % nx
+            j1 = (j0 + 1) % ny
+            k1 = (k0 + 1) % nz
+            # Fractional part within cell
+            fi = (gi - np.floor(gi)).reshape(-1, 1)
+            fj = (gj - np.floor(gj)).reshape(-1, 1)
+            fk = (gk - np.floor(gk)).reshape(-1, 1)
+            # Trilinear interpolation for each j component
+            result = np.zeros((len(pos_cart), 3), dtype=np.float64)
+            for c in range(3):
+                jc = j[c]
+                c000 = jc[i0, j0, k0]
+                c100 = jc[i1, j0, k0]
+                c010 = jc[i0, j1, k0]
+                c110 = jc[i1, j1, k0]
+                c001 = jc[i0, j0, k1]
+                c101 = jc[i1, j0, k1]
+                c011 = jc[i0, j1, k1]
+                c111 = jc[i1, j1, k1]
+                val = (c000 * (1 - fi) * (1 - fj) * (1 - fk) +
+                       c100 * fi * (1 - fj) * (1 - fk) +
+                       c010 * (1 - fi) * fj * (1 - fk) +
+                       c110 * fi * fj * (1 - fk) +
+                       c001 * (1 - fi) * (1 - fj) * fk +
+                       c101 * fi * (1 - fj) * fk +
+                       c011 * (1 - fi) * fj * fk +
+                       c111 * fi * fj * fk)
+                result[:, c] = val.ravel()
+            return result
+
+        # ── Integrate streamlines (forward + backward) ────────────────
+        all_lines = []
+        all_colors = []
+
+        for seed in seed_cart:
+            # Forward integration
+            pts_fwd = [seed.copy()]
+            pos = seed.copy().reshape(1, 3)
+            for _ in range(n_steps):
+                jval = _interp_j(pos)         # (1, 3)
+                jm = np.linalg.norm(jval)
+                if jm < 1e-30 * jmax:
+                    break
+                step = jval[0] / jm * cell_step
+                pos = pos + step.reshape(1, 3)
+                # Wrap back into cell via fractional coords
+                frac_pos = pos @ lat_inv
+                frac_pos = frac_pos % 1.0
+                pos = frac_pos @ lat
+                pts_fwd.append(pos[0].copy())
+
+            # Backward integration
+            pts_bwd = []
+            pos = seed.copy().reshape(1, 3)
+            for _ in range(n_steps):
+                jval = _interp_j(pos)
+                jm = np.linalg.norm(jval)
+                if jm < 1e-30 * jmax:
+                    break
+                step = -jval[0] / jm * cell_step
+                pos = pos + step.reshape(1, 3)
+                frac_pos = pos @ lat_inv
+                frac_pos = frac_pos % 1.0
+                pos = frac_pos @ lat
+                pts_bwd.append(pos[0].copy())
+
+            # Combine: backward (reversed) + seed + forward
+            pts_bwd.reverse()
+            pts = pts_bwd + pts_fwd
+            if len(pts) < 2:
+                continue
+
+            pts = np.array(pts, dtype=np.float32)  # (L, 3)
+
+            # Colour by local |j| at each vertex
+            jvals = _interp_j(pts.astype(np.float64))
+            jmags = np.linalg.norm(jvals, axis=1)
+            alpha_c = np.clip(jmags / (jmax + 1e-30), 0.0, 1.0).astype(np.float32)
+
+            c = np.zeros((len(pts), 4), dtype=np.float32)
+            c[:, 0] = 1.0                                  # R
+            c[:, 1] = np.clip(1.0 - alpha_c, 0.0, 1.0)    # G: yellow→red
+            c[:, 2] = 0.0                                  # B
+            c[:, 3] = np.clip(alpha_c * 2.0, 0.3, 1.0)    # A
+
+            # Add NaN separator between streamlines (for 'strip' connect mode)
+            nan_pt = np.full((1, 3), np.nan, dtype=np.float32)
+            nan_c  = np.zeros((1, 4), dtype=np.float32)
+
+            all_lines.append(pts)
+            all_lines.append(nan_pt)
+            all_colors.append(c)
+            all_colors.append(nan_c)
+
+        if not all_lines:
+            return None, None
+
+        lines  = np.vstack(all_lines)
+        colors = np.vstack(all_colors)
+        return lines, colors
 
     def _build_hud(self):
         """2D text overlay — top-left, pixel coordinates via .pos on canvas.scene."""
@@ -426,7 +658,10 @@ class WavefunctionVisualizer:
         # Compute FFT(psi) once and share with arrow geometry.
         # For spinor wavefunctions, compute a tuple (fft_up, fft_dn).
         psi_k = None
-        if self._show_current and self._arrow_visual is not None:
+        needs_psi_k = (self._show_current and
+                       (self._arrow_visual is not None or
+                        self._streamline_visual is not None))
+        if needs_psi_k:
             if self.prop.is_spinor:
                 psi_k = (fftn(self.prop.psi[0], workers=-1),
                          fftn(self.prop.psi[1], workers=-1))
@@ -434,7 +669,10 @@ class WavefunctionVisualizer:
                 psi_k = fftn(self.prop.psi, workers=-1)
 
         self._update_density()
-        self._update_arrows(psi_k=psi_k)
+        if self._current_mode == 'arrows':
+            self._update_arrows(psi_k=psi_k)
+        elif self._current_mode == 'streamlines':
+            self._update_streamlines(psi_k=psi_k)
         self._update_hud()
 
         self._frame_count += 1
@@ -451,14 +689,9 @@ class WavefunctionVisualizer:
         if not self._show_density or self._vol_visual is None:
             return
 
-        rho = compute_density(self.prop.psi).astype(np.float32)
-        rho_max = rho.max()
-        if rho_max > 0:
-            rho_norm = rho / rho_max
-        else:
-            rho_norm = rho
-
-        self._vol_visual.set_data(rho_norm)
+        vol_norm, vol_max = self._compute_volume_data()
+        self._rho_max = vol_max
+        self._vol_visual.set_data(vol_norm)
         self._vol_visual.clim = (self.density_threshold, 1.0)
 
     def _update_arrows(self, psi_k=None):
@@ -482,6 +715,16 @@ class WavefunctionVisualizer:
         mean_alpha = float(np.mean(alpha)) if len(alpha) > 0 else 0.5
         scaled_arrow_size = 4.0 + mean_alpha * 8.0
         self._arrow_visual.arrow_size = scaled_arrow_size
+
+    def _update_streamlines(self, psi_k=None):
+        if not self._show_current or self._streamline_visual is None:
+            return
+
+        lines, colors = self._compute_streamline_geometry(psi_k=psi_k)
+        if lines is None:
+            return
+
+        self._streamline_visual.set_data(pos=lines, color=colors)
 
     def _update_hud(self):
         if self._hud_text is None:
@@ -507,14 +750,19 @@ class WavefunctionVisualizer:
             spin_line = ""
             wf_type = "scalar"
 
+        vol_label = 'DENSITY |ψ|²' if self._volume_mode == 'density' else 'CURRENT |j|'
+        cur_label = self._current_mode.upper()
+
         info = (
             f" t  = {t_au:.4f} a.u.  ({t_as:.3f} as)  [{wf_type}]\n"
             f" dt = {dt_au:.4f} a.u.  ({dt_as:.3f} as)\n"
             f" step = {self.prop.step_count}  |  spf = {spf}  |  {status}\n"
             f" ||psi||^2 = {norm:.8f}  |  opacity = {opa:.0%}\n"
+            f" volume: {vol_label}  |  current: {cur_label}\n"
             + spin_line +
             f" FPS ~ {fps:.1f}\n"
             f" [SPACE] play/pause  [+/-] speed  [D/J/A/B] toggle\n"
+            f" [V] density/current  [S] arrows/streamlines\n"
             f" [I/K] threshold  [O/L] opacity  [C] cmap  [R] reset  [Q] quit"
         )
         self._hud_text.text = info
@@ -698,8 +946,28 @@ class WavefunctionVisualizer:
 
         elif key.lower() == 'j':
             self._show_current = not self._show_current
-            if self._arrow_visual is not None:
-                self._arrow_visual.visible = self._show_current
+            if self._current_mode == 'arrows':
+                if self._arrow_visual is not None:
+                    self._arrow_visual.visible = self._show_current
+            else:
+                if self._streamline_visual is not None:
+                    self._streamline_visual.visible = self._show_current
+
+        elif key.lower() == 's':
+            # Switch current display: arrows ↔ streamlines
+            if self._current_mode == 'arrows':
+                self._current_mode = 'streamlines'
+                if self._arrow_visual is not None:
+                    self._arrow_visual.visible = False
+                if self._streamline_visual is not None:
+                    self._streamline_visual.visible = self._show_current
+            else:
+                self._current_mode = 'arrows'
+                if self._streamline_visual is not None:
+                    self._streamline_visual.visible = False
+                if self._arrow_visual is not None:
+                    self._arrow_visual.visible = self._show_current
+            print(f"[Current display] → {self._current_mode}")
 
         elif key.lower() == 'a':
             self._show_atoms = not self._show_atoms
@@ -734,6 +1002,14 @@ class WavefunctionVisualizer:
             self._volume_opacity = min(self._volume_opacity + 0.1, 1.0)
             if self._vol_visual is not None:
                 self._vol_visual.cmap = self._make_transparent_cmap()
+
+        elif key.lower() == 'v':
+            # Toggle volume mode: density ↔ current heatmap
+            if self._volume_mode == 'density':
+                self._volume_mode = 'current'
+            else:
+                self._volume_mode = 'density'
+            print(f"[Volume mode] → {self._volume_mode}")
 
         elif key.lower() == 'r':
             lat = self.data.lat
@@ -912,9 +1188,11 @@ class WavefunctionVisualizer:
         print("  SPACE     play / pause animation")
         print("  + / -     double / halve steps per frame")
         print("  D         toggle density volume")
-        print("  J         toggle probability current arrows")
+        print("  J         toggle probability current (arrows or streamlines)")
+        print("  S         switch current display: arrows <-> streamlines")
         print("  A         toggle atom markers")
         print("  B         toggle cell box")
+        print("  V         switch volume: density |psi|^2  <->  current |j(r)|")
         print("  I / K     raise / lower density threshold by 25%")
         print("  O / L     decrease / increase volume opacity by 10%")
         print("  C         cycle colormap")
