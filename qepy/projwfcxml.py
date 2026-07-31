@@ -330,7 +330,7 @@ class ProjwfcXML(object):
                      lab1, lab2 = ['_'+label_1,'_'+label_2]
                      if ib==ib_max1: lab1 = label_1
                      if ib==ib_max2: lab2 = label_2
-                     eig1, eig2 = self.eigen1[:,ib], self.eigen2[:,ib]
+                     eig1, eig2 = self.eigen1[:,ib] + y_offset, self.eigen2[:,ib] + y_offset
                      cax = ax.scatter(kpoints_dists,eig1,s=w_proj1[:,ib]*size,c=color  ,edgecolors='none',alpha=alpha,label=lab1,marker=marker)
                      cax2= ax.scatter(kpoints_dists,eig2,s=w_proj2[:,ib]*size,c=color_2,edgecolors='none',alpha=alpha,label=lab2,marker=marker)
 
